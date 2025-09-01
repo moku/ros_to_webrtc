@@ -28,8 +28,9 @@ SERVER_PORT = 3001
 STUN_TURN_HOST = 'gcs.iotocean.org'
 STUN_TURN_PORT = 3478
 SERVER_URL = f'http://{SERVER_HOST}:{SERVER_PORT}'
-ROOM_ID = 'device1/camera'
-CLIENT_NAME = 'ROS2CameraSender'
+ROOM_ID = 'husky/camera'
+CLIENT_NAME = 'Husky'
+TOPIC = '/camera/camera/color/image_raw'
 
 class ROS2ImageVideoStreamTrack(VideoStreamTrack):
     """Custom video stream track that sends ROS2 camera images"""
@@ -44,8 +45,10 @@ class ROS2ImageVideoStreamTrack(VideoStreamTrack):
         
     def set_frame(self, cv_image):
         """Set the current frame to be sent"""
-        with self.frame_lock:
+        
+        if self.frame_lock.acquire(blocking=False):
             self.current_frame = cv_image.copy()
+            self.frame_lock.release()
         
     def create_frame_with_info(self):
         """Create frame with ROS2 info overlay"""
@@ -83,7 +86,7 @@ class ROS2ImageVideoStreamTrack(VideoStreamTrack):
                    font, font_scale, (0, 0, 0), thickness)
         
         # Add ROS2 topic info
-        topic_text = 'ROS2: /argus/ar0234_front_left/image_raw'
+        topic_text = TOPIC
         topic_y_pos = y_pos + 80
         (topic_width, _), _ = cv2.getTextSize(topic_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
         topic_x_pos = 1920 - topic_width - 50
@@ -96,7 +99,14 @@ class ROS2ImageVideoStreamTrack(VideoStreamTrack):
         pts, time_base = await self.next_timestamp()
         
         # Create frame with ROS2 camera data
-        frame = self.create_frame_with_info()
+        #frame = self.create_frame_with_info()
+        frame = None
+        #if self.frame_lock.acquire(blocking=False):
+        with self.frame_lock:
+            frame = self.current_frame
+        #    self.frame_lock.release()
+        #else:
+        #    return
         self.frame_count += 1
         
         # Debug: Log frame generation and calculate FPS every 30 frames
@@ -128,7 +138,7 @@ class ROS2WebRTCSender(Node):
         self.bridge = CvBridge()
         self.subscription = self.create_subscription(
             Image,
-            '/argus/ar0234_front_left/image_raw',
+            TOPIC,
             self.image_callback,
             10)
         
@@ -140,7 +150,7 @@ class ROS2WebRTCSender(Node):
         self.video_track = ROS2ImageVideoStreamTrack()
         
         self.get_logger().info('🚀 ROS2 WebRTC Camera Streamer initialized')
-        self.get_logger().info(f'📡 Listening on topic: /argus/ar0234_front_left/image_raw')
+        self.get_logger().info(f'📡 Listening on '+TOPIC)
         
         # Start WebRTC in separate thread
         self.webrtc_thread = threading.Thread(target=self.run_webrtc_async)
@@ -446,7 +456,7 @@ class ROS2WebRTCSender(Node):
                 async with session.post(f"{SERVER_URL}/api/rooms", 
                                       json={
                                           "roomId": ROOM_ID,
-                                          "name": "ROS2 Camera Stream", 
+                                          "name": "Husky", 
                                           "maxClients": 20
                                       }) as resp:
                     if resp.status == 200:
