@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ROS2 WebRTC Camera Streamer
-Receives ROS2 camera images from /argus/ar0234_front_left/image_raw and streams via WebRTC
+Receives ROS2 camera images from TOPIC and streams via WebRTC
 """
 
 import rclpy
@@ -11,9 +11,9 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import asyncio
-import threading
 import time
 import logging
+import fractions
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCConfiguration, RTCIceServer
 import socketio
 from av import VideoFrame
@@ -23,14 +23,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Server configuration
-SERVER_HOST = 'gcs.iotocean.org'
+SERVER_HOST = 'gcs.iotocean.org'  # Local server
 SERVER_PORT = 3001
 STUN_TURN_HOST = 'gcs.iotocean.org'
 STUN_TURN_PORT = 3478
 SERVER_URL = f'http://{SERVER_HOST}:{SERVER_PORT}'
 ROOM_ID = 'husky/camera'
-CLIENT_NAME = 'Husky'
-TOPIC = '/camera/camera/color/image_raw'
+CLIENT_NAME = 'HuskyROS'
+TOPIC = '/argus/ar0234_front_left/image_raw'
+FPS = 30.0
+
+# Shared frame buffer (no threading needed)
+current_frame = None
+
 
 class ROS2ImageVideoStreamTrack(VideoStreamTrack):
     """Custom video stream track that sends ROS2 camera images"""
@@ -39,92 +44,34 @@ class ROS2ImageVideoStreamTrack(VideoStreamTrack):
         super().__init__()
         self.frame_count = 0
         self.start_time = time.time()
-        self.last_fps_time = time.time()
-        self.current_frame = None
-        self.frame_lock = threading.Lock()
-        
-    def set_frame(self, cv_image):
-        """Set the current frame to be sent"""
-        
-        if self.frame_lock.acquire(blocking=False):
-            self.current_frame = cv_image.copy()
-            self.frame_lock.release()
-        
-    def create_frame_with_info(self):
-        """Create frame with ROS2 info overlay"""
-        with self.frame_lock:
-            if self.current_frame is None:
-                # Create default frame if no camera data available
-                frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-                cv2.putText(frame, 'Waiting for ROS2 camera data...', (50, 500), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
-            else:
-                # Resize camera image to 1920x1080 if needed
-                frame = cv2.resize(self.current_frame, (1920, 1080))
-        
-        # Add frame counter and info on the right side
-        frame_text = f'Frame: {self.frame_count}'
-        
-        # Calculate text size for positioning
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 2
-        thickness = 3
-        (text_width, text_height), baseline = cv2.getTextSize(frame_text, font, font_scale, thickness)
-        
-        # Position text on the right side of the image
-        x_pos = 1920 - text_width - 50  # 50 pixels from right edge
-        y_pos = 100  # 100 pixels from top
-        
-        # Add white background rectangle for better visibility
-        cv2.rectangle(frame, 
-                     (x_pos - 10, y_pos - text_height - 10), 
-                     (x_pos + text_width + 10, y_pos + baseline + 10), 
-                     (255, 255, 255), -1)
-        
-        # Add frame counter text
-        cv2.putText(frame, frame_text, (x_pos, y_pos), 
-                   font, font_scale, (0, 0, 0), thickness)
-        
-        # Add ROS2 topic info
-        topic_text = TOPIC
-        topic_y_pos = y_pos + 80
-        (topic_width, _), _ = cv2.getTextSize(topic_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
-        topic_x_pos = 1920 - topic_width - 50
-        cv2.putText(frame, topic_text, (topic_x_pos, topic_y_pos), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        
-        return frame
-        
+        self.last_fps_time = time.time()         
+            
     async def recv(self):
+        global current_frame
+
+        # Get accurate timestamp from aiortc
         pts, time_base = await self.next_timestamp()
+                
+        # Return black frame if no camera data available
+        if current_frame is None:
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            av_frame = VideoFrame.from_ndarray(frame, format='rgb24')
+        else:
+            # Use current frame (already in RGB format)
+            av_frame = VideoFrame.from_ndarray(current_frame, format='rgb24')
         
-        # Create frame with ROS2 camera data
-        #frame = self.create_frame_with_info()
-        frame = None
-        #if self.frame_lock.acquire(blocking=False):
-        with self.frame_lock:
-            frame = self.current_frame
-        #    self.frame_lock.release()
-        #else:
-        #    return
         self.frame_count += 1
         
-        # Debug: Log frame generation and calculate FPS every 30 frames
-        if self.frame_count % 30 == 0:
+        # Minimal logging for performance - only every 60 frames
+        if self.frame_count % 60 == 0:
             current_time = time.time()
             elapsed = current_time - self.last_fps_time
-            fps = 30.0 / elapsed if elapsed > 0 else 0
-            total_elapsed = current_time - self.start_time
-            avg_fps = self.frame_count / total_elapsed if total_elapsed > 0 else 0
-            
-            logger.info(f"📹 ROS2 Frame {self.frame_count} (PTS: {pts}) | Current FPS: {fps:.1f} | Avg FPS: {avg_fps:.1f}")
+            fps = 60.0 / elapsed if elapsed > 0 else 0
+            logger.info(f"📹 Frame {self.frame_count} | FPS: {fps:.1f}")
             self.last_fps_time = current_time
         
-        # Convert BGR to RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Create VideoFrame
-        av_frame = VideoFrame.from_ndarray(frame, format='rgb24')
         av_frame.pts = pts
         av_frame.time_base = time_base
 
@@ -147,35 +94,46 @@ class ROS2WebRTCSender(Node):
         self.ice_servers = []
         self.peer_connections = {}
         self.client_id = None
-        self.video_track = ROS2ImageVideoStreamTrack()
+        self.shared_video_track = ROS2ImageVideoStreamTrack()  # Single shared track
+                
+        # FPS control
+        self.last_frame_time = 0
+        self.frame_interval = 1.0 / FPS   
         
         self.get_logger().info('🚀 ROS2 WebRTC Camera Streamer initialized')
         self.get_logger().info(f'📡 Listening on '+TOPIC)
         
-        # Start WebRTC in separate thread
-        self.webrtc_thread = threading.Thread(target=self.run_webrtc_async)
-        self.webrtc_thread.daemon = True
-        self.webrtc_thread.start()
-        
         self.setup_socket_handlers()
     
+    def set_frame(self, cv_image):
+        global current_frame
+        
+        """Set current frame for streaming"""
+        # Direct BGR to RGB conversion
+        frame = cv_image.copy()
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Update global frame (atomic operation)
+        current_frame = frame
+        
     def image_callback(self, msg):
         """Callback for ROS2 image messages"""
-        try:
-            # Convert ROS2 Image message to OpenCV image
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            
-            # Update the video track with new frame
-            self.video_track.set_frame(cv_image)
+        
+        current_time = time.time()
+        
+        # Only update frame if enough time has passed (FPS control)
+        if current_time - self.last_frame_time >= self.frame_interval:            
+            try:
+                # Convert ROS2 Image message to OpenCV image
+                cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')            
                             
-        except Exception as e:
-            self.get_logger().error(f'Failed to convert ROS2 image: {e}')
-    
-    def run_webrtc_async(self):
-        """Run WebRTC asyncio loop in separate thread"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.start_webrtc())
+                # Update the video track with new frame
+                self.set_frame(cv_image)
+                self.last_frame_time = current_time
+                                
+            except Exception as e:
+                self.get_logger().error(f'Failed to convert ROS2 image: {e}')
     
     def setup_socket_handlers(self):
         @self.sio.event
@@ -202,13 +160,24 @@ class ROS2WebRTCSender(Node):
         @self.sio.on('client-joined')
         async def client_joined(data):
             logger.info(f"WebRTC client joined: {data['clientName']}")
-            await self.create_peer_connection(data['clientId'])
+            
+            # Only connect to relay servers, not regular clients
+            if 'RelayServer' in data['clientName']:
+                logger.info(f"🎯 Detected relay server: {data['clientName']}")
+                await self.create_peer_connection(data['clientId'])
+            else:
+                logger.info(f"👤 Regular client {data['clientName']} - relay server will handle them")
         
         @self.sio.on('room-clients')
         async def room_clients(data):
             logger.info(f"Existing WebRTC clients in room: {len(data['clients'])}")
+            # Only connect to relay servers in the room
             for client in data['clients']:
-                await self.create_peer_connection(client['clientId'])
+                if 'RelayServer' in client.get('clientName', ''):
+                    logger.info(f"🎯 Found existing relay server: {client['clientName']}")
+                    await self.create_peer_connection(client['clientId'])
+                else:
+                    logger.info(f"👤 Regular client {client.get('clientName', 'Unknown')} - relay server will handle them")
         
         @self.sio.event
         async def offer(data):
@@ -272,15 +241,15 @@ class ROS2WebRTCSender(Node):
         async def on_connection_state_change():
             logger.info(f"WebRTC peer connection with {client_id} state: {pc.connectionState}")
             if pc.connectionState == "connected":
-                logger.info(f"🎥 ROS2 camera stream flowing to {client_id}")
+                logger.info(f"🎥 ROS2 camera stream flowing to {client_id}")            
         
         @pc.on("iceconnectionstatechange")
         async def on_ice_connection_state_change():
             logger.info(f"🧊 ICE connection state with {client_id}: {pc.iceConnectionState}")
         
-        # Add ROS2 video track
-        pc.addTrack(self.video_track)
-        logger.info(f"Added ROS2 camera video track to peer connection {client_id}")
+        # Add shared ROS2 video track
+        pc.addTrack(self.shared_video_track)
+        logger.info(f"Added shared ROS2 camera video track to peer connection {client_id}")
         
         # Create and send offer
         await self.create_offer(client_id)
@@ -328,8 +297,8 @@ class ROS2WebRTCSender(Node):
             await self.sio.emit('answer', {
                 'targetClientId': client_id,
                 'answer': {
-                    'type': pc.setLocalDescription.type,
-                    'sdp': pc.setLocalDescription.sdp
+                    'type': pc.localDescription.type,
+                    'sdp': pc.localDescription.sdp
                 }
             })
             logger.info(f"Sent WebRTC answer to {client_id}")
@@ -443,8 +412,8 @@ class ROS2WebRTCSender(Node):
         pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
         self.peer_connections[client_id] = pc
         
-        pc.addTrack(self.video_track)
-        logger.info(f"Added ROS2 camera video track to peer connection {client_id} (no offer)")
+        pc.addTrack(self.shared_video_track)
+        logger.info(f"Added shared ROS2 camera video track to peer connection {client_id} (no offer)")
         
         return pc
     
@@ -456,7 +425,7 @@ class ROS2WebRTCSender(Node):
                 async with session.post(f"{SERVER_URL}/api/rooms", 
                                       json={
                                           "roomId": ROOM_ID,
-                                          "name": "Husky", 
+                                          "name": CLIENT_NAME, 
                                           "maxClients": 20
                                       }) as resp:
                     if resp.status == 200:
@@ -496,10 +465,26 @@ class ROS2WebRTCSender(Node):
                 await pc.close()
             await self.sio.disconnect()
 
+    def start_webrtc_async(self):
+        """Start WebRTC connection asynchronously"""
+        return asyncio.create_task(self.start_webrtc())
+
 def main(args=None):
     rclpy.init(args=args)
     
     node = ROS2WebRTCSender()
+    
+    # Start WebRTC in background
+    import threading
+    webrtc_task = None
+    
+    def run_webrtc():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(node.start_webrtc())
+    
+    webrtc_thread = threading.Thread(target=run_webrtc, daemon=True)
+    webrtc_thread.start()
     
     try:
         rclpy.spin(node)

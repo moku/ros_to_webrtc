@@ -29,6 +29,7 @@ setup(
     entry_points={
         'console_scripts': [
             'webrtc_ros_sender = webrtc_camera_streamer.webrtc_ros_sender:main',
+            'webrtc_ros_sender_gstreamer = webrtc_camera_streamer.webrtc_ros_sender_gstreamer:main',
         ],
     },
 )
