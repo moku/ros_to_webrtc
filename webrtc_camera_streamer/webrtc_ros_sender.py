@@ -15,6 +15,7 @@ import time
 import logging
 import fractions
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCConfiguration, RTCIceServer
+from aiortc.codecs import get_capabilities
 import socketio
 from av import VideoFrame
 
@@ -28,7 +29,7 @@ SERVER_PORT = 3001
 STUN_TURN_HOST = 'gcs.iotocean.org'
 STUN_TURN_PORT = 3478
 SERVER_URL = f'http://{SERVER_HOST}:{SERVER_PORT}'
-ROOM_ID = 'husky/camera'
+ROOM_ID = 'husky/camera3'
 CLIENT_NAME = 'HuskyROS'
 TOPIC = '/argus/ar0234_front_left/image_raw'
 FPS = 30.0
@@ -141,7 +142,8 @@ class ROS2WebRTCSender(Node):
             logger.info("Connected to WebRTC signaling server")
             await self.sio.emit('join-room', {
                 'roomId': self.actual_room_id,
-                'clientName': CLIENT_NAME
+                'clientName': CLIENT_NAME,
+                'role': 'sender'
             })
         
         @self.sio.event
@@ -181,7 +183,7 @@ class ROS2WebRTCSender(Node):
         
         @self.sio.event
         async def offer(data):
-            await self.handle_offer(data)
+            pass
         
         @self.sio.event
         async def answer(data):
@@ -248,7 +250,22 @@ class ROS2WebRTCSender(Node):
             logger.info(f"🧊 ICE connection state with {client_id}: {pc.iceConnectionState}")
         
         # Add shared ROS2 video track
-        pc.addTrack(self.shared_video_track)
+        #pc.addTrack(self.shared_video_track)
+
+        video_track = ROS2ImageVideoStreamTrack()
+
+        transceiver = pc.addTransceiver(video_track, direction="sendonly")
+
+        if hasattr(transceiver, 'setCodecPreferences'):
+            # Get available codecs and prioritize H.264
+            codecs = get_capabilities("video").codecs
+            h264_codecs = [c for c in codecs if c.mimeType.lower() == "video/h264"]
+            
+            if h264_codecs:
+                # Set H.264 codec preferences with fastest settings
+                transceiver.setCodecPreferences(h264_codecs)
+                logger.info(f"✅ Configured H.264 codec for fastest encoding on {client_id}")
+
         logger.info(f"Added shared ROS2 camera video track to peer connection {client_id}")
         
         # Create and send offer
@@ -274,38 +291,7 @@ class ROS2WebRTCSender(Node):
             }
         })
         logger.info(f"Sent WebRTC offer to {client_id}")
-    
-    async def handle_offer(self, data):
-        """Handle incoming offer"""
-        client_id = data['fromClientId']
-        offer = data['offer']
         
-        if client_id not in self.peer_connections:
-            await self.create_peer_connection_without_offer(client_id)
-        
-        pc = self.peer_connections[client_id]
-        
-        try:
-            await pc.setRemoteDescription(RTCSessionDescription(
-                sdp=offer['sdp'],
-                type=offer['type']
-            ))
-            
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            
-            await self.sio.emit('answer', {
-                'targetClientId': client_id,
-                'answer': {
-                    'type': pc.localDescription.type,
-                    'sdp': pc.localDescription.sdp
-                }
-            })
-            logger.info(f"Sent WebRTC answer to {client_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to handle WebRTC offer from {client_id}: {e}")
-    
     async def handle_answer(self, data):
         """Handle incoming answer"""
         client_id = data['fromClientId']
@@ -396,26 +382,6 @@ class ROS2WebRTCSender(Node):
             logger.error(f"Failed to add ICE candidate from {client_id}: {e}")
             logger.error(f"Candidate data: {candidate_data}")
             # Continue anyway - connection might still work
-    
-    async def create_peer_connection_without_offer(self, client_id):
-        """Create peer connection without sending offer"""
-        if client_id in self.peer_connections:
-            return self.peer_connections[client_id]
-        
-        ice_servers = []
-        for server in self.ice_servers:
-            if isinstance(server, dict):
-                ice_servers.append(RTCIceServer(urls=server["urls"]))
-            else:
-                ice_servers.append(server)
-        
-        pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
-        self.peer_connections[client_id] = pc
-        
-        pc.addTrack(self.shared_video_track)
-        logger.info(f"Added shared ROS2 camera video track to peer connection {client_id} (no offer)")
-        
-        return pc
     
     async def ensure_room_exists(self):
         """Ensure the WebRTC room exists"""
