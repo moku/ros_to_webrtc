@@ -1,4 +1,18 @@
 from setuptools import find_packages, setup
+from setuptools.command.build_py import build_py as _build_py
+import subprocess
+from pathlib import Path
+
+class build_py(_build_py):
+    def run(self):
+        # 빌드 전에 external 파일 동기화
+        '''root = Path(__file__).parent
+        script = root / "scripts" / "update_external_lib.py"
+        print(f"[webrtc_camera_streamer] Updating WebRTCSender.py via {script}")
+        subprocess.check_call(["python3", str(script)], cwd=root)'''
+
+        # 원래 build_py 동작
+        super().run()
 
 package_name = 'webrtc_camera_streamer'
 
@@ -18,8 +32,11 @@ setup(
         'python-socketio[asyncio]',
         'aiohttp',
         'numpy<2',  # Pin to NumPy 1.x for cv_bridge compatibility
-        'opencv-python>=4.5.0,<4.6.0'  # Compatible with NumPy 1.x
+        'opencv-python>=4.5.0,<4.6.0' # Compatible with NumPy 1.x        
     ],
+    cmdclass={
+        'build_py': build_py,  # ⬅️ 여기서 우리가 custom build를 씌움
+    },
     zip_safe=True,
     maintainer='sjlee',
     maintainer_email='sjlee88@keti.re.kr',
